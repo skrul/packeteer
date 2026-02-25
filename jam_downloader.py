@@ -190,8 +190,8 @@ class JamSessionDownloader:
             await self.playwright.stop()
     
     def is_dropbox_docx(self, url: str) -> bool:
-        """Check if URL is a Dropbox .docx file"""
-        return 'dropbox.com' in url and '.docx' in url
+        """Check if URL is a Dropbox .doc/.docx file"""
+        return 'dropbox.com' in url and ('.docx' in url or '.doc' in url)
     
     def is_dropbox_pdf(self, url: str) -> bool:
         """Check if URL is a Dropbox .pdf file"""
@@ -326,8 +326,8 @@ class JamSessionDownloader:
             return False
     
     def download_dropbox_simple(self, url: str, filepath: Path) -> bool:
-        """Download Dropbox .docx as PDF using Gotenberg"""
-        print(f"    Converting .docx to PDF using Gotenberg...")
+        """Download Dropbox .doc/.docx as PDF using Gotenberg"""
+        print("    Converting .doc/.docx to PDF using Gotenberg...")
         return self.download_docx_with_gotenberg(url, filepath)
     
     def download_google_docs_simple(self, url: str, filepath: Path) -> bool:
