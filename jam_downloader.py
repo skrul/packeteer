@@ -24,6 +24,46 @@ class JamSessionDownloader:
         self.downloads = []
         self.errors = []
         self.gotenberg_started = False
+
+    def _ensure_gotenberg(self):
+        """Start Gotenberg container if not already running"""
+        import subprocess
+        if self.gotenberg_started:
+            return
+        print(f"    Starting Gotenberg container...")
+        subprocess.run(['docker', 'stop', 'gotenberg-temp'],
+                     check=False, capture_output=True)
+        subprocess.run(['docker', 'rm', 'gotenberg-temp'],
+                     check=False, capture_output=True)
+        result = subprocess.run([
+            'docker', 'run', '-d', '--rm',
+            '--name', 'gotenberg-temp',
+            '-p', '3001:3000',
+            'gotenberg/gotenberg:8'
+        ], check=True, capture_output=True, text=True)
+        print(f"    Container started: {result.stdout.strip()}")
+        for i in range(10):
+            try:
+                test_response = requests.get('http://localhost:3001/health', timeout=5)
+                if test_response.status_code == 200:
+                    print(f"    Gotenberg is ready!")
+                    self.gotenberg_started = True
+                    break
+            except requests.exceptions.RequestException:
+                pass
+            print(f"    Waiting for Gotenberg to start... ({i+1}/10)")
+            time.sleep(3)
+        if not self.gotenberg_started:
+            raise Exception("Gotenberg container failed to start")
+
+    def stop_gotenberg(self):
+        """Stop the Gotenberg container if it was started"""
+        if self.gotenberg_started:
+            import subprocess
+            print("Cleaning up Gotenberg container...")
+            subprocess.run(['docker', 'stop', 'gotenberg-temp'],
+                         check=False, capture_output=True)
+            self.gotenberg_started = False
         
     def extract_doc_id(self, url: str) -> Optional[str]:
         """Extract document ID from Google Docs URL"""
@@ -54,6 +94,7 @@ class JamSessionDownloader:
         # Convert to easily searchable format
         link_map = {}
         for url, text in links:
+            url = html.unescape(url)
             # Clean up the link text
             clean_text = html.unescape(text.strip())
             clean_text = re.sub(r'<[^>]+>', '', clean_text)  # Remove any remaining HTML tags
@@ -118,15 +159,18 @@ class JamSessionDownloader:
         
         return attendees
     
-    def find_song_links(self, song_text: str, link_map: Dict[str, str]) -> List[str]:
-        """Find links associated with a song title"""
+    def find_song_links(self, song_text: str, link_map: Dict[str, str]) -> List[Tuple[str, str]]:
+        """Find links associated with a song title.
+
+        Returns list of (url, link_text) tuples.
+        """
         # Look for exact or partial matches in the link map
         song_lower = song_text.lower()
         found_links = []
-        
+
         # First try exact match
         if song_lower in link_map:
-            found_links.append(link_map[song_lower])
+            found_links.append((link_map[song_lower], song_lower))
         else:
             # Try partial matches - look for links that contain key parts of the song title
             song_words = re.findall(r'\w+', song_lower)
@@ -135,17 +179,17 @@ class JamSessionDownloader:
                     # Skip non-song links
                     if any(skip in link_text for skip in ['spotify', 'packet']):
                         continue
-                    
+
                     # Check if this link text contains significant words from the song
                     link_words = re.findall(r'\w+', link_text)
                     matches = sum(1 for word in song_words[:3] if word in link_words)  # Check first 3 words
-                    
+
                     # Also check if the first word of the song title matches (for cases like "Sledgehammer")
                     first_word_match = len(song_words) > 0 and song_words[0] in link_words
-                    
+
                     if matches >= min(2, len(song_words)) or (first_word_match and len(song_words[0]) > 4):
-                        found_links.append(url)
-        
+                        found_links.append((url, link_text))
+
         return found_links
     
     def clean_filename(self, title: str) -> str:
@@ -413,10 +457,9 @@ class JamSessionDownloader:
     
     def download_docx_with_gotenberg(self, url: str, filepath: Path) -> bool:
         """Download .docx file and convert to PDF using Gotenberg"""
-        import subprocess
         import tempfile
-        import requests
-        
+
+        temp_docx_path = None
         try:
             # First, download the .docx file
             print(f"    Downloading .docx file from Dropbox...")
@@ -427,54 +470,20 @@ class JamSessionDownloader:
                     direct_url += '&dl=1'
             else:
                 direct_url = url
-            
+
             response = requests.get(direct_url, stream=True, timeout=30)
             response.raise_for_status()
-            
+
             # Save to temporary file
             with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as temp_docx:
                 for chunk in response.iter_content(chunk_size=8192):
                     temp_docx.write(chunk)
                 temp_docx_path = temp_docx.name
-            
+
             print(f"    Downloaded .docx to temporary file")
-            
-            # Start Gotenberg container if not already running
-            if not self.gotenberg_started:
-                print(f"    Starting Gotenberg container...")
-                # Stop any existing container first
-                subprocess.run(['docker', 'stop', 'gotenberg-temp'], 
-                             check=False, capture_output=True)
-                subprocess.run(['docker', 'rm', 'gotenberg-temp'], 
-                             check=False, capture_output=True)
-                
-                # Start new container
-                result = subprocess.run([
-                    'docker', 'run', '-d', '--rm', 
-                    '--name', 'gotenberg-temp',
-                    '-p', '3001:3000',
-                    'gotenberg/gotenberg:8'
-                ], check=True, capture_output=True, text=True)
-                
-                print(f"    Container started: {result.stdout.strip()}")
-                
-                # Wait for container to be ready
-                import time
-                for i in range(10):  # Wait up to 30 seconds
-                    try:
-                        test_response = requests.get('http://localhost:3001/health', timeout=5)
-                        if test_response.status_code == 200:
-                            print(f"    Gotenberg is ready!")
-                            self.gotenberg_started = True
-                            break
-                    except requests.exceptions.RequestException:
-                        pass
-                    print(f"    Waiting for Gotenberg to start... ({i+1}/10)")
-                    time.sleep(3)
-                
-                if not self.gotenberg_started:
-                    raise Exception("Gotenberg container failed to start")
-            
+
+            self._ensure_gotenberg()
+
             # Convert using Gotenberg API
             print(f"    Converting .docx to PDF with Gotenberg...")
             with open(temp_docx_path, 'rb') as docx_file:
@@ -485,93 +494,58 @@ class JamSessionDownloader:
                     timeout=60
                 )
                 convert_response.raise_for_status()
-                
+
                 # Save the PDF
                 with open(filepath, 'wb') as pdf_file:
                     pdf_file.write(convert_response.content)
-            
+
             print(f"    ✓ Successfully converted .docx to PDF")
             return True
-            
+
         except Exception as e:
             self.errors.append(f"Failed to convert .docx to PDF {url}: {e}")
             print(f"    ✗ Gotenberg conversion failed: {e}")
             return False
         finally:
-            # Clean up
-            try:
-                os.unlink(temp_docx_path)
-            except:
-                pass
+            if temp_docx_path:
+                try:
+                    os.unlink(temp_docx_path)
+                except:
+                    pass
     
     def download_google_docs_with_gotenberg(self, url: str, filepath: Path) -> bool:
         """Download Google Docs document and convert to PDF using Gotenberg"""
-        import subprocess
         import tempfile
-        import requests
-        
+
+        temp_docx_path = None
         try:
             # Convert Google Docs URL to export format (docx)
             print(f"    Downloading Google Doc as .docx...")
-            
+
             # Extract document ID from URL
             doc_id = None
             if '/document/d/' in url:
                 doc_id = url.split('/document/d/')[1].split('/')[0]
-            
+
             if not doc_id:
                 raise Exception("Could not extract Google Doc ID from URL")
-            
+
             # Use Google Docs export API to get .docx format
             export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=docx"
-            
+
             response = requests.get(export_url, stream=True, timeout=30)
             response.raise_for_status()
-            
+
             # Save to temporary file
             with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as temp_docx:
                 for chunk in response.iter_content(chunk_size=8192):
                     temp_docx.write(chunk)
                 temp_docx_path = temp_docx.name
-            
+
             print(f"    Downloaded Google Doc to temporary file")
-            
-            # Start Gotenberg container if not already running
-            if not self.gotenberg_started:
-                print(f"    Starting Gotenberg container...")
-                # Stop any existing container first
-                subprocess.run(['docker', 'stop', 'gotenberg-temp'], 
-                             check=False, capture_output=True)
-                subprocess.run(['docker', 'rm', 'gotenberg-temp'], 
-                             check=False, capture_output=True)
-                
-                # Start new container
-                result = subprocess.run([
-                    'docker', 'run', '-d', '--rm', 
-                    '--name', 'gotenberg-temp',
-                    '-p', '3001:3000',
-                    'gotenberg/gotenberg:8'
-                ], check=True, capture_output=True, text=True)
-                
-                print(f"    Container started: {result.stdout.strip()}")
-                
-                # Wait for container to be ready
-                import time
-                for i in range(10):  # Wait up to 30 seconds
-                    try:
-                        test_response = requests.get('http://localhost:3001/health', timeout=5)
-                        if test_response.status_code == 200:
-                            print(f"    Gotenberg is ready!")
-                            self.gotenberg_started = True
-                            break
-                    except requests.exceptions.RequestException:
-                        pass
-                    print(f"    Waiting for Gotenberg to start... ({i+1}/10)")
-                    time.sleep(3)
-                
-                if not self.gotenberg_started:
-                    raise Exception("Gotenberg container failed to start")
-            
+
+            self._ensure_gotenberg()
+
             # Convert using Gotenberg API
             print(f"    Converting Google Doc to PDF with Gotenberg...")
             with open(temp_docx_path, 'rb') as docx_file:
@@ -582,24 +556,24 @@ class JamSessionDownloader:
                     timeout=60
                 )
                 convert_response.raise_for_status()
-                
+
                 # Save the PDF
                 with open(filepath, 'wb') as pdf_file:
                     pdf_file.write(convert_response.content)
-            
+
             print(f"    ✓ Successfully converted Google Doc to PDF")
             return True
-            
+
         except Exception as e:
             self.errors.append(f"Failed to convert Google Doc to PDF {url}: {e}")
             print(f"    ✗ Google Doc conversion failed: {e}")
             return False
         finally:
-            # Clean up
-            try:
-                os.unlink(temp_docx_path)
-            except:
-                pass
+            if temp_docx_path:
+                try:
+                    os.unlink(temp_docx_path)
+                except:
+                    pass
     
     def download_with_subprocess_playwright(self, url: str, filepath: Path) -> bool:
         """Use subprocess to run Playwright in isolation to avoid hanging"""
@@ -865,16 +839,16 @@ asyncio.run(download_pdf())
                     
                     clean_title = self.clean_filename(song['title'])
                     
-                    for link_num, link in enumerate(song['links']):
+                    for link_num, (link_url, link_text) in enumerate(song['links']):
                         if len(song['links']) == 1:
                             filename = f"{attendee['order']:02d} - {attendee['name']} - {song_num:02d} - {clean_title}.pdf"
                         else:
                             filename = f"{attendee['order']:02d} - {attendee['name']} - {song_num:02d} - {clean_title} - v{link_num+1:02d}.pdf"
-                    
+
                     filepath = self.output_dir / filename
-                    
+
                     print(f"    Song {song_num:02d}: {song['title']}")
-                    if self.download_file(link, filepath):
+                    if self.download_file(link_url, filepath):
                         self.downloads.append(str(filepath))
                         print(f"      ✓ Saved: {filename}")
                     else:
@@ -914,12 +888,7 @@ def main():
     try:
         downloader.process_document(args.doc_url, person_filter=args.person)
     finally:
-        # Clean up Gotenberg container
-        if downloader.gotenberg_started:
-            print("Cleaning up Gotenberg container...")
-            import subprocess
-            subprocess.run(['docker', 'stop', 'gotenberg-temp'], 
-                         check=False, capture_output=True)
+        downloader.stop_gotenberg()
 
 
 if __name__ == "__main__":

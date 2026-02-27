@@ -16,14 +16,7 @@
 
 Install with:
 ```bash
-pip install requests
-```
-
-Or use the provided files:
-```bash
-pip install -r requirements.txt
-# or
-poetry install
+uv sync
 ```
 
 ### Docker Setup
@@ -69,7 +62,7 @@ ________________
 ## Usage
 
 ```bash
-python jam_downloader.py <google_doc_url> [--output <directory>] [--person <name>]
+uv run jam_downloader.py <google_doc_url> [--output <directory>] [--person <name>]
 ```
 
 ### Parameters
@@ -82,17 +75,17 @@ python jam_downloader.py <google_doc_url> [--output <directory>] [--person <name
 
 ```bash
 # Download all songs
-python jam_downloader.py "https://docs.google.com/document/d/YOUR_DOC_ID/edit?usp=sharing"
+uv run jam_downloader.py "https://docs.google.com/document/d/YOUR_DOC_ID/edit?usp=sharing"
 
 # Download to specific directory
-python jam_downloader.py "https://docs.google.com/document/d/YOUR_DOC_ID/edit" -o monthly_charts
+uv run jam_downloader.py "https://docs.google.com/document/d/YOUR_DOC_ID/edit" -o monthly_charts
 
 # Download only Gary's songs (preserves his original order number)
-python jam_downloader.py "https://docs.google.com/document/d/YOUR_DOC_ID/edit" -p Gary
+uv run jam_downloader.py "https://docs.google.com/document/d/YOUR_DOC_ID/edit" -p Gary
 
 # Case insensitive and partial matching work
-python jam_downloader.py "https://docs.google.com/document/d/YOUR_DOC_ID/edit" -p dave  # matches "Dave"
-python jam_downloader.py "https://docs.google.com/document/d/YOUR_DOC_ID/edit" -p car   # matches "Carolyn"
+uv run jam_downloader.py "https://docs.google.com/document/d/YOUR_DOC_ID/edit" -p dave  # matches "Dave"
+uv run jam_downloader.py "https://docs.google.com/document/d/YOUR_DOC_ID/edit" -p car   # matches "Carolyn"
 ```
 
 ## Output
@@ -126,9 +119,9 @@ Where:
 The output is designed to work seamlessly with the existing `packeteer.py`:
 
 ```bash
-python jam_downloader.py "google-doc-url"
+uv run jam_downloader.py "google-doc-url"
 # Review downloaded files in charts/
-python packeteer.py charts
+uv run packeteer.py charts
 # Result: charts/output.pdf
 ```
 

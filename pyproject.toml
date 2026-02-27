@@ -1,18 +1,12 @@
-[tool.poetry]
+[project]
 name = "jam-downloader"
 version = "0.1.0"
 description = "Automated downloader for jam session song charts from Google Docs"
-authors = ["Your Name <your.email@example.com>"]
-readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.31.0",
+    "playwright>=1.40.0",
+    "google-api-python-client>=2.100.0",
+    "google-auth-oauthlib>=1.1.0",
+]
 
-[tool.poetry.dependencies]
-python = "^3.8"
-requests = "^2.31.0"
-playwright = "^1.40.0"
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
-
-[tool.poetry.scripts]
-jam-downloader = "jam_downloader:main"
