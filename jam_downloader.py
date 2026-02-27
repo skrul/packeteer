@@ -83,101 +83,84 @@ class JamSessionDownloader:
             return None
     
     def parse_jam_session(self, html_content: str, doc_id: str) -> List[Dict]:
-        """Parse HTML content to extract attendees and their songs with links"""
+        """Parse HTML content to extract attendees and their songs with links.
+
+        Parses the HTML structure directly: attendee names are in <p> tags
+        followed by <ul> lists where each <li> is a song. Links within each
+        <li> provide both the URL and song title directly.
+        """
         if not html_content:
             return []
-        
-        # Find all links in the HTML
-        link_pattern = r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
-        links = re.findall(link_pattern, html_content, re.IGNORECASE | re.DOTALL)
-        
-        # Convert to easily searchable format
-        link_map = {}
-        for url, text in links:
-            url = html.unescape(url)
-            # Clean up the link text
-            clean_text = html.unescape(text.strip())
-            clean_text = re.sub(r'<[^>]+>', '', clean_text)  # Remove any remaining HTML tags
-            link_map[clean_text.lower()] = url
-        
-        # Get the plain text version to parse structure
-        try:
-            text_response = requests.get(f"https://docs.google.com/document/d/{doc_id}/export?format=txt")
-            text_content = text_response.text if text_response.ok else ""
-        except:
-            text_content = ""
-        
-        # Fallback: strip HTML tags roughly if no text content
-        if not text_content:
-            text_content = re.sub(r'<[^>]+>', '\n', html_content)
-        
+
+        # Split HTML into top-level elements (paragraphs and lists)
+        # Each <p> might be an attendee name, each <ul> contains their songs
+        elements = re.findall(r'<(?:p|ul)[^>]*>.*?</(?:p|ul)>', html_content, re.DOTALL)
+
         attendees = []
         current_attendee = None
-        
-        lines = text_content.split('\n')
-        for line in lines:
-            line = line.strip()
-            # Skip empty lines and known header/footer elements
-            if (not line or 
-                line.startswith('PHA ') or 
-                line.startswith('﻿PHA ') or  # Handle BOM character
-                line in ['Spotify Playlist', 'PACKET', '________________'] or
-                '=' in line):
-                continue
-            
-            # Check if this is an attendee name (not starting with *)
-            if not line.startswith('*') and not line.startswith('...'):
-                # Additional filtering for non-attendee lines
-                if (len(line.split()) <= 3 and  # Names are usually 1-3 words
-                    not any(char in line for char in ['http', '.com', '(', ')', '[', ']']) and  # Not links or descriptions
-                    line.replace(' ', '').isalpha()):  # Only letters and spaces
-                    
+
+        for element in elements:
+            if element.startswith('<p'):
+                # Extract plain text from paragraph
+                text = re.sub(r'<[^>]+>', '', element).strip()
+                text = html.unescape(text)
+
+                # Skip empty, headers, and non-name lines
+                if (not text or
+                    text.startswith('PHA ') or
+                    text.startswith('\ufeffPHA ') or
+                    text in ['Spotify Playlist', 'PACKET', '________________'] or
+                    '=' in text):
+                    continue
+
+                # Check if this looks like an attendee name
+                if (len(text.split()) <= 3 and
+                    not any(s in text for s in ['http', '.com', '(', ')', '[', ']']) and
+                    text.replace(' ', '').isalpha()):
                     current_attendee = {
-                        'name': line,
-                        'order': None,  # Will be assigned later only if they have songs
+                        'name': text,
+                        'order': None,
                         'songs': []
                     }
                     attendees.append(current_attendee)
-            elif line.startswith('*') and current_attendee:
-                # This is a song under the current attendee
-                song_text = line[1:].strip()  # Remove the *
-                if song_text and song_text != '...':
-                    # Look for links associated with this song
-                    song_links = self.find_song_links(song_text, link_map)
-                    
+
+            elif element.startswith('<ul') and current_attendee is not None:
+                # Parse each list item as a song
+                items = re.findall(r'<li[^>]*>(.*?)</li>', element, re.DOTALL)
+                for item in items:
+                    # Get the full plain text of the item
+                    item_text = re.sub(r'<[^>]+>', '', item).strip()
+                    item_text = html.unescape(item_text)
+
+                    if not item_text or item_text == '...':
+                        continue
+
+                    # Extract links directly from this list item
+                    link_pattern = r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
+                    item_links = re.findall(link_pattern, item, re.DOTALL)
+
+                    song_links = []
+                    for url, link_text in item_links:
+                        url = html.unescape(url)
+                        clean_text = re.sub(r'<[^>]+>', '', html.unescape(link_text)).strip()
+                        # Skip non-song links
+                        if any(skip in clean_text.lower() for skip in ['spotify', 'packet']):
+                            continue
+                        song_links.append((url, clean_text))
+
                     current_attendee['songs'].append({
-                        'title': song_text,
+                        'title': item_text,
                         'links': song_links
                     })
-        
-        # Now assign order numbers only to attendees with songs
+
+        # Assign order numbers only to attendees with songs
         attendee_order = 0
         for attendee in attendees:
-            if attendee['songs']:  # Only if they have songs
+            if attendee['songs']:
                 attendee_order += 1
                 attendee['order'] = attendee_order
-        
+
         return attendees
-    
-    def find_song_links(self, song_text: str, link_map: Dict[str, str]) -> List[Tuple[str, str]]:
-        """Find links associated with a song title.
-
-        Returns list of (url, link_text) tuples.
-        Matches links whose text appears within the song text.
-        """
-        song_lower = song_text.lower()
-        found_links = []
-
-        for link_text, url in link_map.items():
-            # Skip non-song links
-            if any(skip in link_text for skip in ['spotify', 'packet']):
-                continue
-
-            # Check if the link text appears within the song text
-            if link_text in song_lower:
-                found_links.append((url, link_text))
-
-        return found_links
     
     def clean_filename(self, title: str) -> str:
         """Clean song title for use in filename"""
@@ -778,6 +761,42 @@ asyncio.run(download_pdf())
             print(f"    ✗ Subprocess error: {e}")
             return False
     
+    def download_and_combine(self, links: List[Tuple[str, str]], filepath: Path, filename: str) -> None:
+        """Download multiple links and combine them into a single PDF."""
+        from PyPDF2 import PdfWriter, PdfReader
+        import tempfile
+
+        temp_files = []
+        try:
+            for i, (link_url, link_text) in enumerate(links):
+                temp_path = filepath.parent / f".tmp_{filepath.stem}_{i}.pdf"
+                temp_files.append(temp_path)
+                print(f"      Downloading part {i+1}/{len(links)}: {link_text}")
+                if not self.download_file(link_url, temp_path):
+                    print(f"      ✗ Failed to download part {i+1}")
+                    return
+
+            writer = PdfWriter()
+            for temp_path in temp_files:
+                reader = PdfReader(open(temp_path, "rb"))
+                for page in reader.pages:
+                    writer.add_page(page)
+
+            with open(filepath, "wb") as out:
+                writer.write(out)
+
+            self.downloads.append(str(filepath))
+            print(f"      ✓ Combined {len(links)} parts into: {filename}")
+        except Exception as e:
+            self.errors.append(f"Failed to combine PDFs for {filename}: {e}")
+            print(f"      ✗ Failed to combine: {e}")
+        finally:
+            for temp_path in temp_files:
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+
     def process_document(self, doc_url: str, person_filter: str = None) -> None:
         """Main processing function"""
         print(f"Processing document: {doc_url}")
@@ -823,23 +842,23 @@ asyncio.run(download_pdf())
                     if not song['links']:
                         print(f"    Song {song_num:02d}: {song['title']} (No links found)")
                         continue
-                    
-                    clean_title = self.clean_filename(song['title'])
-                    
-                    for link_num, (link_url, link_text) in enumerate(song['links']):
-                        if len(song['links']) == 1:
-                            filename = f"{attendee['order']:02d} - {attendee['name']} - {song_num:02d} - {clean_title}.pdf"
-                        else:
-                            filename = f"{attendee['order']:02d} - {attendee['name']} - {song_num:02d} - {clean_title} - v{link_num+1:02d}.pdf"
 
+                    clean_title = self.clean_filename(song['title'])
+                    filename = f"{attendee['order']:02d} - {attendee['name']} - {song_num:02d} - {clean_title}.pdf"
                     filepath = self.output_dir / filename
 
                     print(f"    Song {song_num:02d}: {song['title']}")
-                    if self.download_file(link_url, filepath):
-                        self.downloads.append(str(filepath))
-                        print(f"      ✓ Saved: {filename}")
+
+                    if len(song['links']) == 1:
+                        link_url, link_text = song['links'][0]
+                        if self.download_file(link_url, filepath):
+                            self.downloads.append(str(filepath))
+                            print(f"      ✓ Saved: {filename}")
+                        else:
+                            print(f"      ✗ Failed: {filename}")
                     else:
-                        print(f"      ✗ Failed: {filename}")
+                        # Multiple links - download each and combine into one PDF
+                        self.download_and_combine(song['links'], filepath, filename)
         
         # No async cleanup needed with subprocess approach
         
