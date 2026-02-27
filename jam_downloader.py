@@ -163,32 +163,19 @@ class JamSessionDownloader:
         """Find links associated with a song title.
 
         Returns list of (url, link_text) tuples.
+        Matches links whose text appears within the song text.
         """
-        # Look for exact or partial matches in the link map
         song_lower = song_text.lower()
         found_links = []
 
-        # First try exact match
-        if song_lower in link_map:
-            found_links.append((link_map[song_lower], song_lower))
-        else:
-            # Try partial matches - look for links that contain key parts of the song title
-            song_words = re.findall(r'\w+', song_lower)
-            if song_words:
-                for link_text, url in link_map.items():
-                    # Skip non-song links
-                    if any(skip in link_text for skip in ['spotify', 'packet']):
-                        continue
+        for link_text, url in link_map.items():
+            # Skip non-song links
+            if any(skip in link_text for skip in ['spotify', 'packet']):
+                continue
 
-                    # Check if this link text contains significant words from the song
-                    link_words = re.findall(r'\w+', link_text)
-                    matches = sum(1 for word in song_words[:3] if word in link_words)  # Check first 3 words
-
-                    # Also check if the first word of the song title matches (for cases like "Sledgehammer")
-                    first_word_match = len(song_words) > 0 and song_words[0] in link_words
-
-                    if matches >= min(2, len(song_words)) or (first_word_match and len(song_words[0]) > 4):
-                        found_links.append((url, link_text))
+            # Check if the link text appears within the song text
+            if link_text in song_lower:
+                found_links.append((url, link_text))
 
         return found_links
     
