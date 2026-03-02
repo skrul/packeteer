@@ -15,9 +15,12 @@ import argparse
 import csv
 import os
 import re
+import shutil
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
+from urllib.parse import unquote
 
 from jam_downloader import JamSessionDownloader
 from musicbrainz_lookup import MusicBrainzLookup
@@ -132,7 +135,7 @@ class ArchiveBuilder:
             keys.add(key)
         return keys
 
-    def scan_url(self, doc_url: str, existing_rows: List[Dict], doc_title: str = "") -> List[Dict]:
+    def scan_url(self, doc_url: str, existing_rows: List[Dict], doc_title: str = "", lookup_years: bool = False) -> List[Dict]:
         """Parse a single Google Doc and return new manifest rows."""
         downloader = JamSessionDownloader(str(self.archive_dir))
         doc_id = downloader.extract_doc_id(doc_url)
@@ -184,7 +187,9 @@ class ArchiveBuilder:
                     # Still add to manifest with empty source_url so user can fill in
                     key = (title.lower(), artist.lower(), "", "")
                     if key not in existing_keys:
-                        year = self.mb.get_year(title, artist) if artist else None
+                        year = None
+                        if lookup_years and artist:
+                            year = self.mb.get_year(title, artist)
                         row = {
                             "month": month,
                             "person": person,
@@ -207,7 +212,9 @@ class ArchiveBuilder:
                     if key in existing_keys:
                         continue
 
-                    year = self.mb.get_year(title, artist) if artist else None
+                    year = None
+                    if lookup_years and artist:
+                        year = self.mb.get_year(title, artist)
 
                     row = {
                         "month": month,
@@ -233,12 +240,13 @@ class ArchiveBuilder:
                 or not row.get("source_url")
                 or row.get("month") == "unknown")
 
-    def cmd_scan(self, urls: List, titles: List[str] = None, split: bool = False):
+    def cmd_scan(self, urls: List, titles: List[str] = None, split: bool = False, lookup_years: bool = False):
         """Scan one or more Google Docs and append new songs to manifest.
 
         urls: list of URL strings
         titles: optional parallel list of document titles (from Drive API)
         split: if True, write two manifests (ready + needs_attention)
+        lookup_years: if True, do MusicBrainz year lookups during scan (slow)
         """
         existing_rows = self._read_manifest()
         all_new = []
@@ -246,7 +254,7 @@ class ArchiveBuilder:
         for i, url in enumerate(urls):
             title = titles[i] if titles and i < len(titles) else ""
             print(f"\nScanning: {title or url}")
-            new_rows = self.scan_url(url, existing_rows + all_new, doc_title=title)
+            new_rows = self.scan_url(url, existing_rows + all_new, doc_title=title, lookup_years=lookup_years)
             all_new.extend(new_rows)
             print(f"  Found {len(new_rows)} new song entries")
 
@@ -279,6 +287,46 @@ class ArchiveBuilder:
         if not split:
             print(f"  Manifest: {self.manifest_path}")
 
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        """Normalize a URL to a canonical key for bundle detection."""
+        # Unwrap Google redirect
+        m = re.search(r'[?&]q=([^&]+)', url)
+        if m:
+            url = unquote(m.group(1))
+        # Strip fragment
+        url = url.split('#')[0]
+        # Extract Google Doc ID
+        m = re.search(r'/document/d/([a-zA-Z0-9_-]+)', url)
+        if m:
+            return 'gdoc:' + m.group(1)
+        # Extract Google Drive file ID
+        m = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url)
+        if m:
+            return 'gdrive:' + m.group(1)
+        # Dropbox: use path without query
+        if 'dropbox.com' in url:
+            from urllib.parse import urlparse
+            return 'dropbox:' + urlparse(url).path
+        return url
+
+    @staticmethod
+    def _get_page_count(filepath: Path) -> int:
+        """Return page count of a PDF, or 0 on error."""
+        try:
+            from PyPDF2 import PdfReader
+            return len(PdfReader(str(filepath)).pages)
+        except Exception:
+            return 0
+
+    def _move_to_bundles(self, filepath: Path) -> Path:
+        """Move a file to the bundles/ subdirectory."""
+        bundles_dir = self.archive_dir / "bundles"
+        bundles_dir.mkdir(exist_ok=True)
+        dest = bundles_dir / filepath.name
+        shutil.move(str(filepath), str(dest))
+        return dest
+
     def cmd_download(self, dry_run: bool = False):
         """Download pending songs from manifest."""
         rows = self._read_manifest()
@@ -293,23 +341,82 @@ class ArchiveBuilder:
             print("Nothing to download.")
             return
 
+        # Group pending rows by normalized URL to detect duplicates
+        # Same URL = same file, regardless of title differences across months
+        url_groups = defaultdict(list)
+        for r in pending:
+            key = self._normalize_url(r["source_url"])
+            url_groups[key].append(r)
+
+        duplicate_keys = {k for k, v in url_groups.items() if len(v) > 1}
+        if duplicate_keys:
+            dup_songs = sum(len(url_groups[k]) for k in duplicate_keys)
+            print(f"Detected {len(duplicate_keys)} duplicate URLs ({dup_songs} entries, will download once each)")
+
         if dry_run:
             print("\nDry run - would download:")
             for r in pending:
+                url_key = self._normalize_url(r["source_url"])
                 fn = clean_archive_filename(
                     r["title"], r["artist"],
                     r.get("year", ""), r.get("capo", "")
                 )
-                print(f"  {fn}")
+                tag = " [DUP]" if url_key in duplicate_keys else ""
+                print(f"  {fn}{tag}")
                 print(f"    from: {r['source_url']}")
             return
 
         downloader = JamSessionDownloader(str(self.archive_dir))
         downloaded = 0
+        bundles = 0
         errors = 0
+        progress = 0
 
         try:
-            for i, row in enumerate(rows):
+            # Process duplicate URLs: download once, mark all rows as downloaded
+            for key in duplicate_keys:
+                group = url_groups[key]
+                filename = clean_archive_filename(
+                    group[0]["title"], group[0]["artist"],
+                    group[0].get("year", ""), group[0].get("capo", "")
+                )
+                filepath = self.archive_dir / filename
+
+                progress += 1
+                print(f"\n[{progress}/{len(pending)}] {filename} (x{len(group)} months)")
+
+                if filepath.exists():
+                    print(f"  Already exists, marking downloaded")
+                    for r in group:
+                        r["status"] = "downloaded"
+                    downloaded += 1
+                    self._write_manifest(rows)
+                    continue
+
+                if downloader.download_file(group[0]["source_url"], filepath):
+                    pages = self._get_page_count(filepath)
+                    if pages > 4:
+                        dest = self._move_to_bundles(filepath)
+                        for r in group:
+                            r["status"] = "bundle"
+                        bundles += len(group)
+                        print(f"  ✓ Bundle detected ({pages} pages) -> bundles/{filepath.name}")
+                    else:
+                        for r in group:
+                            r["status"] = "downloaded"
+                        downloaded += 1
+                        print(f"  ✓ Downloaded ({pages} pages)")
+                else:
+                    for r in group:
+                        r["status"] = "error"
+                    errors += 1
+                    print(f"  ✗ Failed")
+
+                self._write_manifest(rows)
+
+            # Process individual downloads
+            filenames_used_this_run = set()  # filenames claimed during this download run
+            for row in rows:
                 if row.get("status") != "pending":
                     continue
 
@@ -319,30 +426,51 @@ class ArchiveBuilder:
                 )
                 filepath = self.archive_dir / filename
 
-                print(f"\n[{downloaded + errors + 1}/{len(pending)}] {filename}")
-
-                if filepath.exists():
+                if filepath.exists() and filename not in filenames_used_this_run:
+                    # File existed before this run — same song already downloaded
+                    filenames_used_this_run.add(filename)
+                    progress += 1
+                    print(f"\n[{progress}/{len(pending)}] {filename}")
                     print(f"  Already exists, marking downloaded")
                     row["status"] = "downloaded"
                     downloaded += 1
                     continue
 
+                # Filename collision within this run — different source, same title
+                if filename in filenames_used_this_run:
+                    base = filepath.stem
+                    n = 2
+                    while f"{base} v{n}.pdf" in filenames_used_this_run or (self.archive_dir / f"{base} v{n}.pdf").exists():
+                        n += 1
+                    filename = f"{base} v{n}.pdf"
+                    filepath = self.archive_dir / filename
+
+                filenames_used_this_run.add(filename)
+                progress += 1
+                print(f"\n[{progress}/{len(pending)}] {filename}")
+
                 if downloader.download_file(row["source_url"], filepath):
-                    row["status"] = "downloaded"
-                    downloaded += 1
-                    print(f"  ✓ Downloaded")
+                    pages = self._get_page_count(filepath)
+                    if pages > 4:
+                        dest = self._move_to_bundles(filepath)
+                        row["status"] = "bundle"
+                        bundles += 1
+                        print(f"  ✓ Bundle detected ({pages} pages) -> bundles/{filepath.name}")
+                    else:
+                        row["status"] = "downloaded"
+                        downloaded += 1
+                        print(f"  ✓ Downloaded ({pages} pages)")
                 else:
                     row["status"] = "error"
                     errors += 1
                     print(f"  ✗ Failed")
 
-                # Save progress after each download
                 self._write_manifest(rows)
         finally:
             downloader.stop_gotenberg()
 
         self._write_manifest(rows)
-        print(f"\nDownload complete: {downloaded} succeeded, {errors} failed")
+        print(f"\nDownload complete: {downloaded} downloaded, {bundles} bundled, {errors} failed")
 
     def cmd_status(self):
         """Print summary of manifest status."""
@@ -500,6 +628,8 @@ def main():
                            help="Use Google Drive API to find all PHA docs")
     scan_parser.add_argument("--split", action="store_true",
                             help="Split into manifest.csv (ready) and needs_attention.csv")
+    scan_parser.add_argument("--lookup-years", action="store_true",
+                            help="Do MusicBrainz year lookups during scan (slow, can be done later)")
 
     # download
     dl_parser = subparsers.add_parser("download", help="Download pending songs from manifest")
@@ -517,16 +647,17 @@ def main():
 
     if args.command == "scan":
         split = args.split
+        lookup_years = args.lookup_years
         if args.discover:
             urls, titles = builder.cmd_discover()
             if urls:
-                builder.cmd_scan(urls, titles=titles, split=split)
+                builder.cmd_scan(urls, titles=titles, split=split, lookup_years=lookup_years)
         elif args.url:
-            builder.cmd_scan([args.url], split=split)
+            builder.cmd_scan([args.url], split=split, lookup_years=lookup_years)
         elif args.urls:
             with open(args.urls) as f:
                 urls = [line.strip() for line in f if line.strip()]
-            builder.cmd_scan(urls, split=split)
+            builder.cmd_scan(urls, split=split, lookup_years=lookup_years)
 
     elif args.command == "merge":
         builder.cmd_merge()

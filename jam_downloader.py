@@ -99,7 +99,7 @@ class JamSessionDownloader:
         attendees = []
         current_attendee = None
 
-        for element in elements:
+        for idx, element in enumerate(elements):
             if element.startswith('<p'):
                 # Extract plain text from paragraph
                 text = re.sub(r'<[^>]+>', '', element).strip()
@@ -123,6 +123,25 @@ class JamSessionDownloader:
                         'songs': []
                     }
                     attendees.append(current_attendee)
+                elif current_attendee is not None:
+                    # Check for bundle links in <p> before a <ul>
+                    # (person provides a single PDF with all their songs)
+                    next_is_ul = (idx + 1 < len(elements) and
+                                  elements[idx + 1].startswith('<ul'))
+                    if next_is_ul:
+                        link_pattern = r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
+                        p_links = re.findall(link_pattern, element, re.DOTALL)
+                        for url, link_text in p_links:
+                            url = html.unescape(url)
+                            clean_text = re.sub(r'<[^>]+>', '', html.unescape(link_text)).strip()
+                            if clean_text.startswith('http'):
+                                continue
+                            if any(skip in clean_text.lower() for skip in ['spotify', 'packet']):
+                                continue
+                            current_attendee['songs'].append({
+                                'title': clean_text,
+                                'links': [(url, clean_text)],
+                            })
 
             elif element.startswith('<ul') and current_attendee is not None:
                 # Parse each list item as a song
@@ -146,10 +165,18 @@ class JamSessionDownloader:
                         # Skip non-song links
                         if any(skip in clean_text.lower() for skip in ['spotify', 'packet']):
                             continue
+                        # Skip bare URLs (link text is the URL itself)
+                        if clean_text.startswith('http'):
+                            continue
                         song_links.append((url, clean_text))
 
+                    # Strip any bare URLs that leaked into the item text
+                    clean_item_text = re.sub(r'https?://\S+', '', item_text).strip()
+                    # Collapse whitespace and clean up stray punctuation
+                    clean_item_text = re.sub(r'\s+', ' ', clean_item_text).strip()
+
                     current_attendee['songs'].append({
-                        'title': item_text,
+                        'title': clean_item_text or item_text,
                         'links': song_links
                     })
 
@@ -354,25 +381,20 @@ class JamSessionDownloader:
         """Download Dropbox .pdf file using direct download"""
         try:
             # Convert sharing URL to direct download URL
-            if 'dropbox.com/scl/fi/' in url:
-                # Change dl=0 to dl=1 for direct download
-                direct_url = url.replace('&dl=0', '&dl=1').replace('?dl=0', '?dl=1')
-                if 'dl=1' not in direct_url:
-                    direct_url += '&dl=1'
-                
-                print(f"    Using Dropbox direct download...")
-                response = requests.get(direct_url, stream=True, timeout=30)
-                response.raise_for_status()
-                
-                with open(filepath, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                
-                print(f"    ✓ Dropbox PDF download successful")
-                return True
-            else:
-                print(f"    ✗ Unsupported Dropbox URL format")
-                return False
+            direct_url = url.replace('&dl=0', '&dl=1').replace('?dl=0', '?dl=1')
+            if 'dl=1' not in direct_url:
+                direct_url += '&dl=1'
+
+            print(f"    Using Dropbox direct download...")
+            response = requests.get(direct_url, stream=True, timeout=30)
+            response.raise_for_status()
+
+            with open(filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            print(f"    ✓ Dropbox PDF download successful")
+            return True
                 
         except Exception as e:
             self.errors.append(f"Failed to download Dropbox PDF {url}: {e}")
@@ -434,12 +456,9 @@ class JamSessionDownloader:
             # First, download the .docx file
             print(f"    Downloading .docx file from Dropbox...")
             # Convert sharing URL to direct download URL
-            if 'dropbox.com/scl/fi/' in url:
-                direct_url = url.replace('&dl=0', '&dl=1').replace('?dl=0', '?dl=1')
-                if 'dl=1' not in direct_url:
-                    direct_url += '&dl=1'
-            else:
-                direct_url = url
+            direct_url = url.replace('&dl=0', '&dl=1').replace('?dl=0', '?dl=1')
+            if 'dl=1' not in direct_url:
+                direct_url += '&dl=1'
 
             response = requests.get(direct_url, stream=True, timeout=30)
             response.raise_for_status()

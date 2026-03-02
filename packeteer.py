@@ -338,7 +338,16 @@ def main():
         pagesize = existing_pdf.pages[0].mediabox
         upperLeftY = int(pagesize.upper_left[1])
 
-        title = os.path.splitext(file)[0]
+        raw_title = os.path.splitext(file)[0]
+        # Format title as "Name - Song Title (N)" from "01 - Name - 01 - Song Title"
+        parts = raw_title.decode("utf-8").split(' - ')
+        if len(parts) >= 4:
+            name = parts[1].strip()
+            song_num = int(parts[2].strip())
+            song_title = ' - '.join(parts[3:]).strip()
+            title = f"{name} - {song_title} ({song_num})"
+        else:
+            title = raw_title.decode("utf-8")
 
         packet = io.BytesIO()
         can = canvas.Canvas(packet, pagesize=(pagesize.width, pagesize.height))
