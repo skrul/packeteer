@@ -18,29 +18,49 @@ import html
 
 
 class JamSessionDownloader:
-    def __init__(self, output_dir: str = "charts"):
+    def __init__(self, output_dir: str = "charts", container_runtime: str = None):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         self.downloads = []
         self.errors = []
         self.gotenberg_started = False
+        self.container_runtime = container_runtime
 
     def _ensure_gotenberg(self):
         """Start Gotenberg container if not already running"""
         import subprocess
         if self.gotenberg_started:
             return
-        print(f"    Starting Gotenberg container...")
-        subprocess.run(['docker', 'stop', 'gotenberg-temp'],
+        runtime = self.container_runtime
+        print(f"    Starting Gotenberg container (using '{runtime}')...")
+        subprocess.run([runtime, 'stop', 'gotenberg-temp'],
                      check=False, capture_output=True)
-        subprocess.run(['docker', 'rm', 'gotenberg-temp'],
+        subprocess.run([runtime, 'rm', 'gotenberg-temp'],
                      check=False, capture_output=True)
-        result = subprocess.run([
-            'docker', 'run', '-d', '--rm',
-            '--name', 'gotenberg-temp',
-            '-p', '3001:3000',
-            'gotenberg/gotenberg:8'
-        ], check=True, capture_output=True, text=True)
+        try:
+            if runtime == 'docker':
+                # Mount host /tmp into container so LibreOffice has enough disk space
+                import tempfile
+                gotenberg_tmp = Path(tempfile.gettempdir()) / 'gotenberg-work'
+                gotenberg_tmp.mkdir(exist_ok=True)
+                cmd = [
+                    runtime, 'run', '-d', '--rm',
+                    '--name', 'gotenberg-temp',
+                    '-p', '3001:3000',
+                    '-v', f'{gotenberg_tmp}:/tmp',
+                    'gotenberg/gotenberg:8'
+                ]
+            else:
+                cmd = [
+                    runtime, 'run', '-d',
+                    '--name', 'gotenberg-temp',
+                    '-p', '3001:3000',
+                    'gotenberg/gotenberg:8'
+                ]
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error: Failed to start Gotenberg container: {e.stderr.strip()}", file=sys.stderr)
+            sys.exit(1)
         print(f"    Container started: {result.stdout.strip()}")
         for i in range(10):
             try:
@@ -54,14 +74,18 @@ class JamSessionDownloader:
             print(f"    Waiting for Gotenberg to start... ({i+1}/10)")
             time.sleep(3)
         if not self.gotenberg_started:
-            raise Exception("Gotenberg container failed to start")
+            print("Error: Gotenberg container failed to become ready after 30 seconds.", file=sys.stderr)
+            sys.exit(1)
 
     def stop_gotenberg(self):
         """Stop the Gotenberg container if it was started"""
         if self.gotenberg_started:
             import subprocess
+            runtime = self.container_runtime
             print("Cleaning up Gotenberg container...")
-            subprocess.run(['docker', 'stop', 'gotenberg-temp'],
+            subprocess.run([runtime, 'stop', 'gotenberg-temp'],
+                         check=False, capture_output=True)
+            subprocess.run([runtime, 'rm', 'gotenberg-temp'],
                          check=False, capture_output=True)
             self.gotenberg_started = False
         
@@ -462,6 +486,8 @@ class JamSessionDownloader:
 
             response = requests.get(direct_url, stream=True, timeout=30)
             response.raise_for_status()
+            content_type = response.headers.get('content-type', 'unknown')
+            print(f"    Dropbox response content-type: {content_type}")
 
             # Save to temporary file
             with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as temp_docx:
@@ -469,19 +495,27 @@ class JamSessionDownloader:
                     temp_docx.write(chunk)
                 temp_docx_path = temp_docx.name
 
-            print(f"    Downloaded .docx to temporary file")
+            file_size = os.path.getsize(temp_docx_path)
+            print(f"    Downloaded .docx to temporary file ({file_size} bytes)")
+            if file_size < 1000:
+                print(f"    Warning: file is suspiciously small, download may have failed")
 
             self._ensure_gotenberg()
 
             # Convert using Gotenberg API
             print(f"    Converting .docx to PDF with Gotenberg...")
             with open(temp_docx_path, 'rb') as docx_file:
-                files = {'files': docx_file}
+                files = {
+                    'files': ('document.docx', docx_file,
+                              'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+                }
                 convert_response = requests.post(
                     'http://localhost:3001/forms/libreoffice/convert',
                     files=files,
                     timeout=60
                 )
+                if not convert_response.ok:
+                    print(f"    Gotenberg error body: {convert_response.text[:500]}")
                 convert_response.raise_for_status()
 
                 # Save the PDF
@@ -901,15 +935,92 @@ asyncio.run(download_pdf())
             print(f"Ready for: python packeteer.py {self.output_dir}")
 
 
+def detect_container_runtime(override: str = None) -> str:
+    """Detect available container runtime; exit with error if none found"""
+    import subprocess
+    import json
+
+    if override == 'docker':
+        try:
+            subprocess.run(['docker', 'info'], check=True, capture_output=True, text=True)
+            return 'docker'
+        except FileNotFoundError:
+            print("Error: Docker is not installed or not in PATH.", file=sys.stderr)
+            sys.exit(1)
+        except subprocess.CalledProcessError:
+            print("Error: Docker is installed but not running. Please start Docker Desktop and try again.", file=sys.stderr)
+            sys.exit(1)
+
+    if override == 'container':
+        try:
+            subprocess.run(['container', '--version'], check=True, capture_output=True, text=True)
+        except FileNotFoundError:
+            print("Error: Apple container CLI not found. Run: brew install container", file=sys.stderr)
+            sys.exit(1)
+        # fall through to the container-specific checks below
+
+    if override is None:
+        # Try Docker first
+        try:
+            subprocess.run(['docker', 'info'], check=True, capture_output=True, text=True)
+            return 'docker'
+        except FileNotFoundError:
+            pass
+        except subprocess.CalledProcessError:
+            print("Docker is installed but not running, trying Apple container CLI...")
+
+        # Try Apple container CLI
+        try:
+            subprocess.run(['container', '--version'], check=True, capture_output=True, text=True)
+        except FileNotFoundError:
+            print("Error: No container runtime found.", file=sys.stderr)
+            print("Start Docker Desktop, or run: brew install container", file=sys.stderr)
+            sys.exit(1)
+
+    # Check service is running
+    status = subprocess.run(
+        ['container', 'system', 'status', '--format', 'json'],
+        capture_output=True, text=True
+    )
+    try:
+        if json.loads(status.stdout).get('status') != 'running':
+            raise ValueError
+    except (json.JSONDecodeError, ValueError):
+        print("Error: Apple container service is not running.", file=sys.stderr)
+        print("Run: container system start --enable-kernel-install", file=sys.stderr)
+        sys.exit(1)
+
+    # Check kernel is installed
+    props = subprocess.run(
+        ['container', 'system', 'property', 'list', '--format', 'json'],
+        capture_output=True, text=True
+    )
+    try:
+        if not json.loads(props.stdout).get('kernel', {}).get('binaryPath'):
+            raise ValueError
+    except (json.JSONDecodeError, ValueError):
+        print("Error: Apple container service is running but no kernel is installed.", file=sys.stderr)
+        print("Run: container system start --enable-kernel-install", file=sys.stderr)
+        sys.exit(1)
+
+    return 'container'
+
+
 def main():
     parser = argparse.ArgumentParser(description='Download jam session charts from Google Docs')
     parser.add_argument('doc_url', help='Google Docs URL')
     parser.add_argument('-o', '--output', default='charts', help='Output directory (default: charts)')
     parser.add_argument('-p', '--person', help='Filter by person name (case insensitive, partial match supported)')
-    
+    parser.add_argument('--runtime', choices=['docker', 'container'],
+                        help='Container runtime to use for document conversion (default: auto-detect; '
+                             'docker = Docker Desktop, container = Apple container CLI via brew install container)')
+
     args = parser.parse_args()
-    
-    downloader = JamSessionDownloader(args.output)
+
+    runtime = detect_container_runtime(override=args.runtime)
+    print(f"Using container runtime: {runtime}")
+
+    downloader = JamSessionDownloader(args.output, container_runtime=runtime)
     try:
         downloader.process_document(args.doc_url, person_filter=args.person)
     finally:
