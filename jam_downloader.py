@@ -43,6 +43,15 @@ class JamSessionDownloader:
                 import tempfile
                 gotenberg_tmp = Path(tempfile.gettempdir()) / 'gotenberg-work'
                 gotenberg_tmp.mkdir(exist_ok=True)
+                # Gotenberg's LibreOffice process runs as a non-root user inside
+                # the container, so it needs write access to this bind-mounted
+                # directory. Docker Desktop on macOS is permissive enough that
+                # this doesn't matter there, but on native Linux Docker a
+                # root-owned 0755 dir blocks it with a 500 (mkdir: permission
+                # denied) on every .docx conversion. chmod unconditionally so
+                # this also self-heals a directory left over from before this
+                # fix existed.
+                gotenberg_tmp.chmod(0o777)
                 cmd = [
                     runtime, 'run', '-d', '--rm',
                     '--name', 'gotenberg-temp',
